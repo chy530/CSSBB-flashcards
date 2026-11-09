@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Convert the CSSBB flashcard workbook into data/cards.json for the web app.
 
+Required sheets: Terms, Quiz Bank, Quiz Bank - Meaning (Distractor Glossary is optional).
+
 Usage:
     python tools/build_data.py                 # uses the first .xlsx file in source/
     python tools/build_data.py path/to/file.xlsx
@@ -133,40 +135,74 @@ def main():
             if row and clean(row[0]):
                 glossary[clean(row[0])] = clean(row[1])
 
-    # ---------- Quiz Bank ----------
-    ws = wb["Quiz Bank"]
-    h = header_map(ws)
-    c_qid, c_tid, c_prompt = col(h, "Question ID"), col(h, "Term ID"), col(h, "Question Prompt")
-    wrong_cols = [col(h, f"Wrong Answer {i}") for i in range(1, 7)]
-    why_cols = [col(h, f"Why Wrong {i}") for i in range(1, 7)]
+    # ---------- Quiz banks ----------
+    # "term":    the prompt describes a concept; the user picks the matching term.
+    # "meaning": the prompt names a term; the user picks the matching meaning or use.
     ids = {t["id"] for t in terms}
-    questions, qseen = [], set()
-    for rn, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-        qid = clean(row[c_qid])
-        if not qid:
-            continue
-        tid, prompt = clean(row[c_tid]), clean(row[c_prompt])
-        if qid in qseen:
-            errors.append(f"Quiz Bank row {rn}: duplicate question ID {qid}")
-        qseen.add(qid)
-        if tid not in ids:
-            errors.append(f"Quiz Bank row {rn} ({qid}): term ID '{tid}' not on Terms sheet")
-        if not prompt:
-            errors.append(f"Quiz Bank row {rn} ({qid}): missing question prompt")
-        wrong = []
-        for wc, yc in zip(wrong_cols, why_cols):
-            text, why = clean(row[wc]), clean(row[yc])
-            if not text or not why:
-                errors.append(f"Quiz Bank row {rn} ({qid}): every wrong answer needs text and an explanation")
+    banks = {}
+    all_qids = set()
+
+    def read_bank(sheet, kind):
+        if sheet not in wb.sheetnames:
+            errors.append(f"Missing sheet '{sheet}'")
+            return []
+        ws = wb[sheet]
+        h = header_map(ws)
+        c_qid, c_tid, c_prompt = col(h, "Question ID"), col(h, "Term ID"), col(h, "Question Prompt")
+        c_correct = col(h, "Correct Answer") if kind == "meaning" else None
+        n_wrong = sum(1 for k in h if k.lower().startswith("wrong answer"))
+        if n_wrong < 3:
+            errors.append(f"{sheet}: needs at least 3 'Wrong Answer' columns")
+            return []
+        wrong_cols = [col(h, f"Wrong Answer {i}") for i in range(1, n_wrong + 1)]
+        why_cols = [col(h, f"Why Wrong {i}") for i in range(1, n_wrong + 1)]
+        out, covered = [], set()
+        for rn, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            qid = clean(row[c_qid])
+            if not qid:
                 continue
-            if display.get(text) == tid:
-                errors.append(f"Quiz Bank row {rn} ({qid}): wrong answer '{text}' is the correct answer")
-            if text not in display and text not in glossary:
-                print(f"Note: {qid} wrong answer '{text}' is not a term or glossary entry")
-            wrong.append({"text": text, "why": why, "tid": display.get(text)})
-        if len({w['text'] for w in wrong}) != len(wrong):
-            errors.append(f"Quiz Bank row {rn} ({qid}): wrong answers repeat")
-        questions.append({"id": qid, "tid": tid, "prompt": prompt, "wrong": wrong})
+            where = f"{sheet} row {rn} ({qid})"
+            tid, prompt = clean(row[c_tid]), clean(row[c_prompt])
+            if qid in all_qids:
+                errors.append(f"{where}: question ID is used more than once")
+            all_qids.add(qid)
+            if tid not in ids:
+                errors.append(f"{where}: term ID '{tid}' not on Terms sheet")
+            covered.add(tid)
+            if not prompt:
+                errors.append(f"{where}: missing question prompt")
+            correct = clean(row[c_correct]) if kind == "meaning" else ""
+            if kind == "meaning" and not correct:
+                errors.append(f"{where}: missing correct answer")
+            wrong = []
+            for wc, yc in zip(wrong_cols, why_cols):
+                text, why = clean(row[wc]), clean(row[yc])
+                if not text or not why:
+                    errors.append(f"{where}: every wrong answer needs text and an explanation")
+                    continue
+                item = {"text": text, "why": why}
+                if kind == "term":
+                    item["tid"] = display.get(text)
+                    if item["tid"] == tid:
+                        errors.append(f"{where}: wrong answer '{text}' is the correct answer")
+                    if text not in display and text not in glossary:
+                        print(f"Note: {qid} wrong answer '{text}' is not a term or glossary entry")
+                elif text == correct:
+                    errors.append(f"{where}: a wrong answer repeats the correct answer")
+                wrong.append(item)
+            if len({w["text"] for w in wrong}) != len(wrong):
+                errors.append(f"{where}: wrong answers repeat")
+            q = {"id": qid, "tid": tid, "prompt": prompt, "wrong": wrong}
+            if kind == "meaning":
+                q["correct"] = correct
+            out.append(q)
+        missing = [t for t in ids if t not in covered]
+        if missing:
+            print(f"Note: {sheet} has no question for {len(missing)} term(s), e.g. {', '.join(sorted(missing)[:5])}")
+        return out
+
+    banks["term"] = read_bank("Quiz Bank", "term")
+    banks["meaning"] = read_bank("Quiz Bank - Meaning", "meaning")
 
     if errors:
         print("\nThe workbook has problems that must be fixed before publishing:\n")
@@ -176,19 +212,21 @@ def main():
             print(f"  ... and {len(errors) - 60} more")
         sys.exit(1)
 
-    payload = {"terms": terms, "questions": questions, "glossary": glossary,
+    payload = {"terms": terms, "banks": banks, "glossary": glossary,
                "sections": [{"name": n, "short": s} for n, s in SECTIONS], "subsections": SUBSECTIONS}
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:8]
     payload["version"] = {
         "id": digest,
         "built": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "source": os.path.basename(path),
-        "terms": len(terms), "questions": len(questions),
+        "terms": len(terms),
+        "questions": {k: len(v) for k, v in banks.items()},
     }
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
-    print(f"Wrote {os.path.relpath(OUT, ROOT)}: {len(terms)} terms, {len(questions)} questions (version {digest})")
+    counts = ", ".join(f"{len(v)} {k}-bank questions" for k, v in banks.items())
+    print(f"Wrote {os.path.relpath(OUT, ROOT)}: {len(terms)} terms, {counts} (version {digest})")
 
 
 if __name__ == "__main__":

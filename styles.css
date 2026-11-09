@@ -209,6 +209,9 @@ p { margin: 0; }
 .choice.wrong { border-color: var(--red-fill); background: var(--red-bg); color: var(--red); }
 .choice.right .k, .choice.wrong .k { border: 0; font-size: 18px; }
 .choice.dim { color: var(--text3); }
+.choice.long { font-size: 15px; align-items: flex-start; }
+.choice.long .k { margin-top: 1px; }
+.clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .choice .tag { margin-left: auto; font-size: 12px; white-space: nowrap; }
 .explain { background: var(--grp); border-radius: 14px; padding: 13px 15px; margin-top: 12px; }
 .explain .h { font-size: 14px; font-weight: 600; margin-bottom: 3px; }

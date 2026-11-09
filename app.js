@@ -95,7 +95,7 @@ const DB = {
 
 const DEF = {
   onboarded: false, examDate: null, newPerDay: 10, maxReviews: 0, termFormat: 'both', front: 'term',
-  showDots: true, includeNonBok: true, quizLen: 10, explain: true, theme: 'system', sessionLen: 40,
+  showDots: true, includeNonBok: true, quizLen: 10, quizType: 'term', explain: true, theme: 'system', sessionLen: 40,
 };
 const fresh = () => ({ v: 1, settings: { ...DEF }, cards: {}, days: {}, quizzes: [], lastBackup: null, contentVersion: null });
 let S = fresh();
@@ -105,7 +105,16 @@ const saveNow = () => { clearTimeout(saveTimer); return DB.set('state', S); };
 
 // ---------- content ----------
 let D = null, TERMS = [];
-const TB = {}, QB = {};
+const TB = {}, QB = { term: {}, meaning: {} };
+// Two quiz formats: "term" shows a description and asks for the term;
+// "meaning" names a term and asks for its meaning or use.
+const QTYPES = { term: 'Name the term', meaning: 'Pick the meaning', mixed: 'Mix both' };
+const QTYPE_HELP = {
+  term: 'Read a description, then choose the term it describes.',
+  meaning: 'Read a term, then choose what it means or when to use it.',
+  mixed: 'Each question randomly uses one of the two formats.',
+};
+const hasQ = (t, type = S.settings.quizType) => (type === 'mixed' ? !!(QB.term[t.id] || QB.meaning[t.id]) : !!QB[type][t.id]);
 const fullName = t => (t.acr ? `${t.term} (${t.acr})` : t.term);
 const disp = t => { const f = S.settings.termFormat; if (!t.acr || f === 'both') return fullName(t); return f === 'acr' ? t.acr : t.term; };
 const faceNames = t => { const f = S.settings.termFormat; if (!t.acr) return [t.term, '']; if (f === 'acr') return [t.acr, t.term]; if (f === 'full') return [t.term, '']; return [t.term, t.acr]; };
@@ -149,7 +158,7 @@ function status(id) {
 const STATUS = { new: 'New', learning: 'Learning', struggling: 'Struggling', mastered: 'Mastered', suspended: 'Suspended' };
 const pool = () => TERMS.filter(t => S.settings.includeNonBok || !t.nonBok);
 const live = () => pool().filter(t => !peek(t.id)?.susp);
-const blankDay = () => ({ rev: 0, newc: 0, qq: 0, qc: 0 });
+const blankDay = () => ({ rev: 0, newc: 0, qq: 0, qc: 0, mq: 0, mc: 0 });
 const day = () => S.days[dkey()] || (S.days[dkey()] = blankDay());
 const dayPeek = () => S.days[dkey()] || blankDay();
 const started = c => c && c.s !== 'new';
@@ -211,13 +220,14 @@ function resetCard(id) {
   S.cards[id] = { s: 'new', due: 0, ivl: 0, ease: 2.5, reps: 0, lapses: 0, last: now(), qc: 0, qt: 0, qwrong: false, qmiss: 0, star: c.star, flag: c.flag };
   save();
 }
-function recordQuiz(tid, ok) {
+function recordQuiz(tid, ok, kind) {
   const c = card(tid);
   c.qt++;
   if (ok) { c.qc++; c.qwrong = false; }
   else { c.qmiss++; c.qwrong = true; if (c.s === 'review' && c.due > now()) c.due = now(); }
   c.last = Math.max(c.last || 0, now());
   const d = day(); d.qq++; if (ok) d.qc++;
+  if (kind === 'meaning') { d.mq = (d.mq || 0) + 1; if (ok) d.mc = (d.mc || 0) + 1; }
   save();
 }
 
@@ -430,7 +440,13 @@ function endSession() {
 }
 
 // ---------- quizzes ----------
-const questionsFor = ts => ts.map(t => QB[t.id]).filter(Boolean);
+function questionsFor(ts, type = S.settings.quizType) {
+  return ts.map(t => {
+    if (type !== 'mixed') return QB[type][t.id];
+    const both = [QB.term[t.id], QB.meaning[t.id]].filter(Boolean);
+    return both[Math.floor(Math.random() * both.length)];
+  }).filter(Boolean);
+}
 function weightedPick(items, w, n) {
   return items.map(x => ({ x, k: Math.pow(Math.random(), 1 / Math.max(0.05, w(x))) })).sort((a, b) => b.k - a.k).slice(0, n).map(o => o.x);
 }
@@ -439,7 +455,7 @@ function quizWeight(t) {
   return 1 + (c?.qwrong ? 4 : 0) + (st === 'struggling' ? 3 : 0) + (st === 'learning' ? 1.5 : 0) - (st === 'mastered' ? 0.5 : 0);
 }
 function quizTerms(src = UI.quizSrc) {
-  let ts = live().filter(t => QB[t.id]);
+  let ts = live().filter(t => hasQ(t));
   if (src === 'mixed') return ts;
   if (src === 'sec') return ts.filter(t => UI.quizSecs.has(t.sec));
   if (src === 'diff') return ts.filter(t => UI.quizDiffs.has(t.diff));
@@ -454,8 +470,10 @@ function buildQuiz(src = UI.quizSrc, n = S.settings.quizLen) {
 }
 function makeItem(q) {
   const wrong = shuffle(q.wrong).slice(0, 3).map(w => ({ tid: w.tid, text: w.text, why: w.why }));
-  return { q, chosen: -1, opts: shuffle([{ tid: q.tid, correct: true }, ...wrong]) };
+  const right = q.kind === 'meaning' ? { text: q.correct, correct: true } : { tid: q.tid, correct: true };
+  return { q, chosen: -1, opts: shuffle([right, ...wrong]) };
 }
+const whyHead = (it, o) => (it.q.kind === 'meaning' ? "Why that's not it" : `Why not ${optLabel(o)}?`);
 function startQuiz(qs) {
   if (!qs.length) { toast('There are no questions here yet'); return; }
   closeLayer();
@@ -468,7 +486,7 @@ function answer(k) {
   it.chosen = k;
   const ok = !!it.opts[k].correct;
   if (ok) QS.correct++;
-  recordQuiz(it.q.tid, ok);
+  recordQuiz(it.q.tid, ok, it.q.kind);
   render(true);
   if (!S.settings.explain) { clearTimeout(advanceTimer); advanceTimer = setTimeout(nextQuestion, ok ? 700 : 1300); }
 }
@@ -482,7 +500,7 @@ function finishQuiz() {
   const answered = QS.items.filter(it => it.chosen >= 0);
   QS.items = answered;
   if (!answered.length) { QS = null; mode = null; render(); return; }
-  S.quizzes.push({ at: now(), n: answered.length, c: QS.correct });
+  S.quizzes.push({ at: now(), n: answered.length, c: QS.correct, type: S.settings.quizType });
   S.quizzes = S.quizzes.slice(-200);
   save(); mode = 'results'; render();
 }
@@ -496,9 +514,9 @@ function reviewQuestion(i) {
   OPS = [];
   sheet(`<div class="bar3"><span></span><span class="t">Question review</span><button class="link r" data-a="dismiss">Done</button></div>
     <div class="prompt" style="font-size:17px">${esc(it.q.prompt)}</div>
-    <div class="choice wrong"><span class="k">${ic('x')}</span><span>${esc(optLabel(o))}</span><span class="tag">Your answer</span></div>
-    <div class="choice right"><span class="k">${ic('check')}</span><span>${esc(disp(t))}</span></div>
-    <div class="explain"><div class="h">Why not ${esc(optLabel(o))}?</div><div class="b">${esc(o.why)}</div></div>
+    <div class="choice wrong ${it.q.kind === 'meaning' ? 'long' : ''}"><span class="k">${ic('x')}</span><span>${esc(optLabel(o))}</span><span class="tag">Your answer</span></div>
+    <div class="choice right ${it.q.kind === 'meaning' ? 'long' : ''}"><span class="k">${ic('check')}</span><span>${esc(optLabel(it.opts.find(x => x.correct)))}</span></div>
+    <div class="explain"><div class="h">${esc(whyHead(it, o))}</div><div class="b">${esc(o.why)}</div></div>
     <div class="explain"><div class="h">${esc(disp(t))}</div><div class="b">${renderDef(t.def, 'sm')}</div></div>`);
 }
 
@@ -549,7 +567,7 @@ function applyImport(st, replace) {
     }
     for (const [k, d] of Object.entries(st.days || {})) {
       const cur = S.days[k];
-      S.days[k] = cur ? { rev: Math.max(cur.rev, d.rev || 0), newc: Math.max(cur.newc, d.newc || 0), qq: Math.max(cur.qq, d.qq || 0), qc: Math.max(cur.qc, d.qc || 0) } : { ...blankDay(), ...d };
+      S.days[k] = cur ? { rev: Math.max(cur.rev, d.rev || 0), newc: Math.max(cur.newc, d.newc || 0), qq: Math.max(cur.qq, d.qq || 0), qc: Math.max(cur.qc, d.qc || 0), mq: Math.max(cur.mq || 0, d.mq || 0), mc: Math.max(cur.mc || 0, d.mc || 0) } : { ...blankDay(), ...d };
     }
     const seen = new Set(S.quizzes.map(q => q.at));
     S.quizzes = [...S.quizzes, ...(st.quizzes || []).filter(q => !seen.has(q.at))].sort((a, b) => a.at - b.at).slice(-200);
@@ -699,7 +717,10 @@ const ROOTS = {
       ['star', 'Starred', '', quizTerms('star').length],
     ];
     const n = Math.min(S.settings.quizLen, quizTerms(src).length);
-    return `<h1 class="lt" style="margin-top:14px">Quiz</h1><p class="cap">Questions from</p>
+    return `<h1 class="lt" style="margin-top:14px">Quiz</h1>
+      <div class="label" style="margin-top:6px">Question type</div>${seg('quizType', [['term', 'Name term'], ['meaning', 'Pick meaning'], ['mixed', 'Mix both']], S.settings.quizType)}
+      <p class="gf" style="margin:6px 4px 0">${esc(QTYPE_HELP[S.settings.quizType])}</p>
+      <div class="label">Questions from</div>
       <div class="grp">${rows.map(([v, l, sub, val]) => `<button class="row" data-a="quizSrc" data-v="${v}" aria-pressed="${src === v}"><span class="grow">${l}${sub ? `<div class="sub">${sub}</div>` : ''}</span><span class="val">${val}</span>${src === v ? `<span style="color:var(--accent)">${ic('check')}</span>` : (v === 'sec' || v === 'diff' ? chev : '<span style="width:17px"></span>')}</button>`).join('')}</div>
       <div class="label">Number of questions</div>${seg('quizLen', [[10, '10'], [20, '20'], [30, '30']], S.settings.quizLen)}
       <div class="grp" style="margin-top:16px"><div class="row static"><span class="grow">Explain each answer<div class="sub">Show why each wrong choice is wrong</div></span>${tog('explain', S.settings.explain, 'Explain each answer')}</div></div>
@@ -719,8 +740,9 @@ const ROOTS = {
   progress() {
     const r = UI.range, P = pool();
     const from = r ? addDays(sod(), -(r - 1)) : 0, fromKey = dkey(from);
-    let rev = 0, qq = 0, qc = 0;
-    Object.entries(S.days).forEach(([k, d]) => { if (!r || k >= fromKey) { rev += d.rev || 0; qq += d.qq || 0; qc += d.qc || 0; } });
+    let rev = 0, qq = 0, qc = 0, mq = 0, mc = 0;
+    Object.entries(S.days).forEach(([k, d]) => { if (!r || k >= fromKey) { rev += d.rev || 0; qq += d.qq || 0; qc += d.qc || 0; mq += d.mq || 0; mc += d.mc || 0; } });
+    const byType = [[QTYPES.term, qc - mc, qq - mq], [QTYPES.meaning, mc, mq]];
     const m = P.filter(t => isMastered(peek(t.id))).length;
     const newM = P.filter(t => { const c = peek(t.id); return isMastered(c) && c.mAt && c.mAt >= from; }).length;
     const startedN = P.filter(t => started(peek(t.id))).length;
@@ -753,6 +775,8 @@ const ROOTS = {
       <div class="h3">Upcoming reviews</div>
       <div class="grp"><div class="fc">${fc.map(v => `<div>${v || ''}<b style="height:${Math.round((v / fmax) * 100)}%"></b></div>`).join('')}</div>
         <div class="fcl">${fc.map((_, k) => `<span>${k === 0 ? 'Today' : fmtDate(addDays(sod(), k), { weekday: 'short' })}</span>`).join('')}</div></div>
+      <div class="h3">Quiz accuracy by question type</div>
+      <div class="grp">${byType.map(([l, c, n]) => `<div class="row static"><span class="grow">${l}<div class="sub">${n ? plural(n, 'question') : 'None yet'}${r ? ` in the last ${r} days` : ''}</div></span><span class="bar"><i style="width:${pct(c, n)}%"></i></span><span class="val" style="width:42px">${n ? pct(c, n) + '%' : '–'}</span></div>`).join('')}</div>
       <div class="h3">Quiz accuracy by difficulty</div>
       <div class="grp">${acc.map(a => `<div class="row static"><span class="grow">${a.l}</span><span class="bar"><i style="width:${a.p}%"></i></span><span class="val" style="width:42px">${a.t ? a.p + '%' : '–'}</span></div>`).join('')}</div>
       <div class="h3">Most missed</div>
@@ -770,6 +794,7 @@ const PICKS = {
   maxReviews: { title: 'Max reviews per day', opts: [[0, 'No limit'], [50, '50'], [100, '100'], [150, '150'], [200, '200']].map(([v, label]) => ({ v, label })) },
   termFormat: { title: 'Term format', opts: [['both', 'Full name and acronym', 'Single-minute exchange of die (SMED)'], ['acr', 'Acronym first', 'SMED'], ['full', 'Full name only', 'Single-minute exchange of die']].map(([v, label, sub]) => ({ v, label, sub })) },
   front: { title: 'Card front shows', opts: [['term', 'Term'], ['def', 'Definition'], ['mixed', 'Mixed']].map(([v, label]) => ({ v, label })) },
+  quizType: { title: 'Question type', opts: Object.entries(QTYPES).map(([v, label]) => ({ v, label, sub: QTYPE_HELP[v] })) },
   quizLen: { title: 'Default quiz length', opts: [10, 20, 30].map(v => ({ v, label: `${v} questions` })) },
   theme: { title: 'Appearance', opts: [['system', 'Match iPhone setting'], ['light', 'Light'], ['dark', 'Dark']].map(([v, label]) => ({ v, label })) },
 };
@@ -797,7 +822,7 @@ const VIEWS = {
 
   term({ id }) {
     const t = TB[id], c = peek(id), stt = status(id), [a, b] = faceNames(t);
-    const q = QB[id];
+    const q = QB.term[id];
     const confused = q ? q.wrong.filter(w => w.tid && TB[w.tid]) : [];
     let next = '–';
     if (started(c)) { const dd = Math.round((sod(c.due) - sod()) / DAY); next = c.due <= now() ? 'Due now' : dd <= 0 ? 'Later today' : dd === 1 ? 'Tomorrow' : `In ${dd} days`; }
@@ -829,7 +854,7 @@ const VIEWS = {
         <div class="row static"><span class="grow">Show difficulty dots</span>${tog('showDots', S.settings.showDots, 'Show difficulty dots')}</div>
         <div class="row static"><span class="grow">Include terms not in the 2022 BoK<div class="sub">EWMA, CUSUM, hoshin kanri, and 3 more</div></span>${tog('includeNonBok', S.settings.includeNonBok, 'Include terms not in the 2022 BoK')}</div>
         <button class="row" data-a="open" data-v="suspended"><span class="grow">Suspended cards</span><span class="val">${sus}</span>${chev}</button></div>
-      <div class="gh">Quiz</div><div class="grp">${row('Default length', 'quizLen')}
+      <div class="gh">Quiz</div><div class="grp">${row('Question type', 'quizType')}${row('Default length', 'quizLen')}
         <div class="row static"><span class="grow">Explain each answer</span>${tog('explain', S.settings.explain, 'Explain each answer')}</div></div>
       <div class="gh">App</div><div class="grp">${row('Appearance', 'theme')}
         <button class="row" data-a="open" data-v="data"><span class="grow">Data and backup</span>${chev}</button>
@@ -856,7 +881,7 @@ const VIEWS = {
       <div class="gh">Flagged terms</div><div class="grp"><button class="row" data-a="open" data-v="flags"><span class="grow">Your flags and notes</span><span class="val">${flags}</span>${chev}</button></div>
       <div class="gh">About</div><div class="grp">
         <div class="row static"><span class="grow">Content version</span><span class="val">${esc(D.version.built)} (${esc(D.version.id)})</span></div>
-        <div class="row static"><span class="grow">Content</span><span class="val">${D.version.terms} terms, ${D.version.questions} questions</span></div>
+        <div class="row static"><span class="grow">Content</span><span class="val">${D.version.terms} terms, ${Object.values(D.version.questions).reduce((a, b) => a + b, 0)} questions</span></div>
         <button class="row" data-a="open" data-v="sources"><span class="grow">Sources</span>${chev}</button></div>
       <div class="grp" style="margin-top:24px"><button class="row danger" data-a="resetAll">Reset all progress</button></div>
       <p class="gf">Not affiliated with or endorsed by ASQ.</p>`;
@@ -977,14 +1002,14 @@ const FULL = {
         else if (k === it.chosen) { cls = 'wrong'; key = `<span class="k">${ic('x')}</span>`; tag = '<span class="tag">Your answer</span>'; }
         else cls = 'dim';
       }
-      return `<button class="choice ${cls}" data-a="answer" data-k="${k}" ${done ? 'aria-disabled="true"' : ''}>${key}<span>${esc(optLabel(o))}</span>${tag}</button>`;
+      return `<button class="choice ${cls} ${it.q.kind === 'meaning' ? 'long' : ''}" data-a="answer" data-k="${k}" ${done ? 'aria-disabled="true"' : ''}>${key}<span>${esc(optLabel(o))}</span>${tag}</button>`;
     }).join('');
     let fb = '';
     if (done && S.settings.explain) {
       const star = peek(t.id)?.star;
       fb = (ch.correct
         ? `<div class="explain"><div class="h" style="color:var(--green)">Correct</div>${renderDef(t.def, 'sm')}</div>`
-        : `<div class="explain"><div class="h">Why not ${esc(optLabel(ch))}?</div><div class="b">${esc(ch.why)}</div></div>
+        : `<div class="explain"><div class="h">${esc(whyHead(it, ch))}</div><div class="b">${esc(ch.why)}</div></div>
            <div class="explain"><div class="h">${esc(disp(t))}</div><div class="b">${renderDef(t.def, 'sm')}</div></div>`)
         + `<div class="inline-actions"><button class="link" data-a="peekTerm" data-id="${t.id}">${ic('study')}View card</button><button class="link" data-a="star" data-id="${t.id}">${ic(star ? 'starOn' : 'star')}${star ? 'Starred' : 'Star'}</button></div>`;
     }
@@ -992,7 +1017,7 @@ const FULL = {
     return `<div class="screen">
       <div class="topbar"><button class="ib" data-a="endQuiz" aria-label="End quiz">${ic('x')}</button><span class="t">Question ${QS.i + 1} of ${QS.items.length}</span><span class="small" style="text-align:right;color:var(--green)">${QS.correct} ${ic('check')}</span></div>
       <div class="pb"><i style="width:${pct(QS.i + (done ? 1 : 0), QS.items.length)}%"></i></div>
-      <div><span class="pill">${esc(secShort(t))}</span></div>
+      <div class="chips" style="margin-top:0"><span class="pill">${esc(secShort(t))}</span><span class="pill gray">${QTYPES[it.q.kind]}</span></div>
       <div class="prompt">${esc(it.q.prompt)}</div>
       <div>${opts}</div>${fb}
       ${done && S.settings.explain ? `<div class="footer sticky"><button class="btn" data-a="next">${last ? 'See results' : 'Next question'}</button></div>` : ''}</div>`;
@@ -1006,7 +1031,7 @@ const FULL = {
     return `<div class="screen">
       <div class="ring" style="margin-top:22px"><svg width="84" height="84" viewBox="0 0 64 64" role="img" aria-label="${p} percent correct"><circle cx="32" cy="32" r="27" fill="none" stroke="var(--grp2)" stroke-width="7"/>${c ? `<circle cx="32" cy="32" r="27" fill="none" stroke="var(--green-fill)" stroke-width="7" stroke-dasharray="${((C * c) / n).toFixed(1)} ${C}" transform="rotate(-90 32 32)" stroke-linecap="round"/>` : ''}<text x="32" y="37" text-anchor="middle" font-size="14" font-weight="600" fill="currentColor">${p}%</text></svg>
         <div><h1 style="font-size:24px;font-weight:700;margin:0">${missed.length ? `${c} of ${n} correct` : 'Perfect score'}</h1><p class="cap">${avg !== null ? `Your previous ${plural(recent.length, 'quiz', 'quizzes')} averaged ${avg}%` : 'Your first quiz'}</p></div></div>
-      ${missed.length ? `<div class="h3">Missed</div><div class="grp">${missed.map(({ it, i }) => `<button class="row" data-a="qReview" data-i="${i}"><span class="grow">${esc(disp(TB[it.q.tid]))}<div class="sub">You chose ${esc(optLabel(it.opts[it.chosen]))}</div></span>${chev}</button>`).join('')}</div>` : ''}
+      ${missed.length ? `<div class="h3">Missed</div><div class="grp">${missed.map(({ it, i }) => `<button class="row" data-a="qReview" data-i="${i}"><span class="grow">${esc(disp(TB[it.q.tid]))}<div class="sub clamp">${it.q.kind === 'meaning' ? 'You chose: ' : 'You chose '}${esc(optLabel(it.opts[it.chosen]))}</div></span>${chev}</button>`).join('')}</div>` : ''}
       <div class="footer stack sticky">
         ${missed.length ? `<button class="btn" data-a="retryQuiz">Retry the ${missed.length} missed</button><button class="btn sec" data-a="studyQuiz">Study these cards</button>` : '<button class="btn" data-a="againQuiz">Take another quiz</button>'}
         <button class="btn txt" data-a="closeFull">Done</button></div></div>`;
@@ -1088,12 +1113,13 @@ const A = {
   // quiz tab
   quizSrc(el) {
     const v = el.dataset.v;
-    const has = t => QB[t.id];
+    const has = t => hasQ(t);
     if (v === 'sec') multiPick('Exam sections', D.sections.map((s, i) => ({ v: i, label: s.short, count: live().filter(t => t.sec === i && has(t)).length })), UI.quizSecs, set => { UI.quizSecs = set; UI.quizSrc = set.size ? 'sec' : UI.quizSrc; render(true); });
     else if (v === 'diff') multiPick('Difficulty', [1, 2, 3, 4, 5].map(d => ({ v: d, label: ['', '1, very easy', '2, easy', '3, medium', '4, hard', '5, very hard'][d], count: live().filter(t => t.diff === d && has(t)).length })), UI.quizDiffs, set => { UI.quizDiffs = set; UI.quizSrc = set.size ? 'diff' : UI.quizSrc; render(true); });
     else { UI.quizSrc = v; render(true); }
   },
   quizLen(el) { S.settings.quizLen = +el.dataset.v; save(); render(true); },
+  quizType(el) { S.settings.quizType = el.dataset.v; save(); render(true); },
   startQuiz() { startQuiz(buildQuiz()); },
 
   // multi-pick sheet
@@ -1114,7 +1140,7 @@ const A = {
   fReset() { UI.sort = 'bok'; UI.fDiff.clear(); UI.fStatus.clear(); if (layer().innerHTML) filterSheet(); render(true); },
   fDone() { closeLayer(); render(true); },
   secStudy(el) { const sec = +el.dataset.sec; startSession(shuffle(prioritize(filterTerms(live().filter(t => t.sec === sec))).slice(0, sessionLen())).map(t => t.id)); },
-  secQuiz(el) { const sec = +el.dataset.sec; startQuiz(questionsFor(shuffle(filterTerms(live().filter(t => t.sec === sec && QB[t.id]))).slice(0, S.settings.quizLen))); },
+  secQuiz(el) { const sec = +el.dataset.sec; startQuiz(questionsFor(shuffle(filterTerms(live().filter(t => t.sec === sec && hasQ(t)))).slice(0, S.settings.quizLen))); },
   star(el) { toggleStar(el.dataset.id); render(true); },
   termMenu(el) { termMenu(el.dataset.id); },
   studyOne(el) { startSession([el.dataset.id]); },
@@ -1240,7 +1266,7 @@ async function init() {
   }
   TERMS = D.terms;
   TERMS.forEach(t => { TB[t.id] = t; });
-  D.questions.forEach(q => { QB[q.tid] = q; });
+  Object.entries(D.banks).forEach(([kind, qs]) => qs.forEach(q => { q.kind = kind; QB[kind][q.tid] = q; }));
   if (S.contentVersion && S.contentVersion !== D.version.id) setTimeout(() => toast('Cards updated to the latest version'), 800);
   S.contentVersion = D.version.id;
   if (!S.settings.onboarded) mode = isIOS && !standalone() && !UI.installSkipped ? 'install' : 'onboard';
